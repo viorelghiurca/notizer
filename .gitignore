@@ -1,0 +1,19 @@
+# Python
+core/.venv/
+core/build/
+core/*.egg-info/
+__pycache__/
+.pytest_cache/
+
+# Oberfläche
+app/node_modules/
+app/dist/
+
+# Tauri
+app/src-tauri/target/
+app/src-tauri/gen/schemas/
+app/src-tauri/binaries/notizer-core*
+
+# System
+.DS_Store
+Thumbs.db
