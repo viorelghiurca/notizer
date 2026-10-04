@@ -1,8 +1,8 @@
 //! Notizer Desktop-App: startet den Notizer Core als Hintergrundprozess und
 //! gibt Port und Zugriffstoken an die Oberfläche weiter.
 //!
-//! - Release: Der Core liegt als `notizer-core(.exe)` neben der App (von Tauri
-//!   über `externalBin` mitgeliefert).
+//! - Release: Der Core liegt als Ordner `core/` in den Ressourcen der App
+//!   (`notizer-core(.exe)` plus `_internal/`), siehe `tauri.bundle.conf.json`.
 //! - Entwicklung (`npm run tauri dev`): Der Core wird direkt aus dem Ordner
 //!   `core/` mit Python gestartet, ohne vorher eine Binärdatei zu bauen.
 //!
@@ -35,7 +35,7 @@ fn core_info(state: tauri::State<'_, CoreState>) -> Option<CoreInfo> {
     state.info.lock().ok().and_then(|g| g.clone())
 }
 
-fn core_command() -> Command {
+fn core_command(app: &tauri::AppHandle) -> Command {
     if cfg!(debug_assertions) {
         // Entwicklung: python -m notizer_core aus dem Ordner core/
         let core_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../core");
@@ -57,16 +57,21 @@ fn core_command() -> Command {
         cmd.args(["-m", "notizer_core"]).current_dir(core_dir);
         cmd
     } else {
-        // Release: Binärdatei neben der App
-        let exe = std::env::current_exe().expect("Pfad der App nicht ermittelbar");
-        let dir = exe.parent().expect("Ordner der App nicht ermittelbar");
+        // Release: Core-Ordner in den Ressourcen der App
+        let dir = app
+            .path()
+            .resource_dir()
+            .expect("Ressourcenordner nicht ermittelbar")
+            .join("core");
         let name = if cfg!(windows) { "notizer-core.exe" } else { "notizer-core" };
-        Command::new(dir.join(name))
+        let mut cmd = Command::new(dir.join(name));
+        cmd.current_dir(dir);
+        cmd
     }
 }
 
 fn start_core(app: &tauri::AppHandle) -> std::io::Result<()> {
-    let mut cmd = core_command();
+    let mut cmd = core_command(app);
     cmd.arg("--exit-on-stdin-close")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

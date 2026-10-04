@@ -62,3 +62,34 @@ export const STATUS_LABEL: Record<string, string> = {
   transkribiert: 'Transkribiert',
   fehler: 'Fehler',
 }
+
+export function clock(ms: number): string {
+  const s = Math.floor(ms / 1000)
+  const h = Math.floor(s / 3600)
+  const m = Math.floor((s % 3600) / 60)
+  const sec = s % 60
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(h)}:${pad(m)}:${pad(sec)}`
+}
+
+export const LANGUAGES: { value: string; label: string }[] = [
+  { value: 'de', label: 'Deutsch' },
+  { value: 'en', label: 'Englisch' },
+  { value: 'auto', label: 'Automatisch erkennen' },
+  { value: 'fr', label: 'Französisch' },
+  { value: 'it', label: 'Italienisch' },
+  { value: 'es', label: 'Spanisch' },
+  { value: 'nl', label: 'Niederländisch' },
+  { value: 'pl', label: 'Polnisch' },
+  { value: 'ro', label: 'Rumänisch' },
+  { value: 'tr', label: 'Türkisch' },
+]
+
+export function languageName(code: string | null): string {
+  if (!code) return ''
+  return LANGUAGES.find((l) => l.value === code)?.label ?? code.toUpperCase()
+}
+
+export function speakerColor(idx: number): string {
+  return `var(--s${(idx % 8) + 1})`
+}

@@ -19,6 +19,9 @@ export interface Recording {
   status: RecordingStatus
   favorite: boolean
   deleted_at: string | null
+  language: string | null
+  transcript_model: string | null
+  transcribed_at: string | null
   format: string | null
   original_name: string | null
   size_bytes: number | null
@@ -44,6 +47,78 @@ export interface CoreInfo {
   trash_days: number
 }
 
+export type JobStatus = 'wartet' | 'laeuft' | 'fertig' | 'fehler' | 'abgebrochen'
+
+export interface Job {
+  id: string
+  recording_id: string
+  kind: string
+  status: JobStatus
+  progress: number
+  stage: string
+  error: string | null
+  finished_at: string | null
+}
+
+export interface Segment {
+  id: string
+  idx: number
+  start_ms: number
+  end_ms: number
+  text: string
+  speaker_label: string | null
+  edited: boolean
+}
+
+export interface Speaker {
+  label: string
+  name: string | null
+  idx: number
+  talk_ms: number
+}
+
+export interface Transcript {
+  recording_id: string
+  language: string | null
+  model: string | null
+  transcribed_at: string | null
+  speakers: Speaker[]
+  segments: Segment[]
+}
+
+export interface AppSettings {
+  whisper_model: string
+  language: string
+  diarize: boolean
+  vocabulary: string
+}
+
+export interface ModelInfo {
+  name: string
+  label: string
+  size_mb: number
+  hint: string
+  downloaded: boolean
+}
+
+export interface ModelsOverview {
+  whisper: ModelInfo[]
+  diarization: { downloaded: boolean; size_mb: number }
+  models_dir: string
+}
+
+export interface TranscribeOptions {
+  language?: string
+  diarize?: boolean
+  num_speakers?: number | null
+}
+
+export type CoreEvent =
+  | { type: 'hello'; jobs: Job[] }
+  | { type: 'job'; job: Job }
+  | { type: 'recording'; id: string; status: RecordingStatus }
+  | { type: 'ping' }
+
 export interface ImportResult {
   imported: Recording[]
   skipped: { name: string; reason: string }[]
@@ -60,7 +135,7 @@ async function connect(): Promise<Connection> {
   if (connection) return connection
   if (isTauri()) {
     // Der Core braucht beim ersten Start ein paar Sekunden.
-    for (let i = 0; i < 120; i++) {
+    for (let i = 0; i < 240; i++) {
       const info = await invoke<{ port: number; token: string } | null>('core_info')
       if (info) {
         connection = { base: `http://127.0.0.1:${info.port}`, token: info.token }
@@ -146,8 +221,61 @@ export const api = {
     return `${base}/api/recordings/${id}/audio?token=${encodeURIComponent(token)}`
   },
 
+  transcribe: (id: string, options: TranscribeOptions) =>
+    request<Job>(`/api/recordings/${id}/transcribe`, json('POST', options)),
+  jobs: () => request<Job[]>('/api/jobs'),
+  lastJob: (recId: string) => request<Job | null>(`/api/recordings/${recId}/job`),
+  cancelJob: (id: string) => request<Job>(`/api/jobs/${id}/cancel`, { method: 'POST' }),
+  transcript: (id: string) => request<Transcript>(`/api/recordings/${id}/transcript`),
+  updateSegment: (id: string, patch: Partial<Pick<Segment, 'text' | 'speaker_label'>>) =>
+    request<Segment>(`/api/segments/${id}`, json('PATCH', patch)),
+  renameSpeaker: (recId: string, label: string, name: string) =>
+    request<Speaker>(`/api/recordings/${recId}/speakers/${encodeURIComponent(label)}`, json('PATCH', { name })),
+  exportToFile: (id: string, format: string, path: string) =>
+    request<{ path: string }>(`/api/recordings/${id}/export`, json('POST', { format, path })),
+  async exportUrl(id: string, format: string) {
+    const { base, token } = await connect()
+    return `${base}/api/recordings/${id}/export?format=${format}&token=${encodeURIComponent(token)}`
+  },
+  settings: () => request<AppSettings>('/api/settings'),
+  updateSettings: (patch: Partial<AppSettings>) => request<AppSettings>('/api/settings', json('PATCH', patch)),
+  models: () => request<ModelsOverview>('/api/models'),
+
   folders: () => request<Folder[]>('/api/folders'),
   createFolder: (name: string) => request<Folder>('/api/folders', json('POST', { name })),
   renameFolder: (id: string, name: string) => request<Folder>(`/api/folders/${id}`, json('PATCH', { name })),
   deleteFolder: (id: string) => request<void>(`/api/folders/${id}`, { method: 'DELETE' }),
+}
+
+/** Ereignisse des Cores (Auftragsfortschritt). Verbindet sich bei Abbruch neu. */
+export function subscribeEvents(onEvent: (e: CoreEvent) => void): () => void {
+  let ws: WebSocket | null = null
+  let stopped = false
+  let timer: ReturnType<typeof setTimeout> | undefined
+
+  const open = async () => {
+    try {
+      const { base, token } = await connect()
+      if (stopped) return
+      ws = new WebSocket(`${base.replace('http', 'ws')}/ws?token=${encodeURIComponent(token)}`)
+      ws.onmessage = (m) => {
+        try {
+          onEvent(JSON.parse(m.data) as CoreEvent)
+        } catch {
+          /* ungültige Nachricht ignorieren */
+        }
+      }
+      ws.onclose = () => {
+        if (!stopped) timer = setTimeout(open, 2000)
+      }
+    } catch {
+      if (!stopped) timer = setTimeout(open, 2000)
+    }
+  }
+  void open()
+  return () => {
+    stopped = true
+    clearTimeout(timer)
+    ws?.close()
+  }
 }

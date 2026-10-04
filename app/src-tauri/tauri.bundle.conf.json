@@ -1,5 +1,7 @@
 {
   "bundle": {
-    "externalBin": ["binaries/notizer-core"]
+    "resources": {
+      "core-dist/": "core/"
+    }
   }
 }

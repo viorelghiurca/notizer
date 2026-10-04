@@ -1,12 +1,13 @@
-"""Baut den Notizer Core als einzelne Datei und legt sie für Tauri ab.
+"""Baut den Notizer Core und legt ihn für den Tauri-Installer ab.
 
 Aufruf (aus dem Projektordner, mit aktivierter Core-venv):
 
     python scripts/build_core.py
 
-Ergebnis: app/src-tauri/binaries/notizer-core-<ziel-triple>[.exe]
-Tauri erwartet den Namen mit dem Rust-Ziel-Triple, z. B.
-notizer-core-x86_64-pc-windows-msvc.exe oder notizer-core-x86_64-unknown-linux-gnu.
+Ergebnis: app/src-tauri/core-dist/ mit notizer-core[.exe] und _internal/.
+Der Installer kopiert diesen Ordner als Ressource "core/" neben die App.
+Als Ordner (statt Einzeldatei) startet der Core sofort, weil er sich nicht bei
+jedem Start erst entpacken muss.
 """
 
 from __future__ import annotations
@@ -18,15 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 CORE = ROOT / "core"
-TARGET_DIR = ROOT / "app" / "src-tauri" / "binaries"
-
-
-def target_triple() -> str:
-    out = subprocess.run(["rustc", "-vV"], check=True, capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if line.startswith("host:"):
-            return line.split(":", 1)[1].strip()
-    raise SystemExit("Rust-Ziel-Triple nicht gefunden (ist rustc installiert?)")
+TARGET_DIR = ROOT / "app" / "src-tauri" / "core-dist"
 
 
 def main() -> None:
@@ -34,24 +27,28 @@ def main() -> None:
     subprocess.run(
         [
             sys.executable, "-m", "PyInstaller",
-            "--noconfirm", "--clean", "--onefile",
+            "--noconfirm", "--clean", "--onedir",
             "--name", "notizer-core",
             "--distpath", str(work / "dist"),
             "--workpath", str(work / "pyinstaller"),
             "--specpath", str(work),
             "--collect-submodules", "uvicorn",
             "--collect-submodules", "notizer_core",
+            # Modell der Sprachpausen-Erkennung (silero_vad) liegt als Datei im Paket.
+            # Native Bibliotheken von ctranslate2, onnxruntime, av und sherpa-onnx
+            # findet PyInstaller selbst; zusätzliches Einsammeln würde sie doppelt ablegen.
+            "--collect-data", "faster_whisper",
+            "--copy-metadata", "faster_whisper",
             str(CORE / "run_core.py"),
         ],
         check=True,
         cwd=CORE,
     )
-    suffix = ".exe" if sys.platform == "win32" else ""
-    built = work / "dist" / f"notizer-core{suffix}"
-    TARGET_DIR.mkdir(parents=True, exist_ok=True)
-    dest = TARGET_DIR / f"notizer-core-{target_triple()}{suffix}"
-    shutil.copy2(built, dest)
-    print(f"Core gebaut: {dest} ({dest.stat().st_size / 1e6:.1f} MB)")
+    built = work / "dist" / "notizer-core"
+    shutil.rmtree(TARGET_DIR, ignore_errors=True)
+    shutil.copytree(built, TARGET_DIR)
+    size = sum(f.stat().st_size for f in TARGET_DIR.rglob("*") if f.is_file())
+    print(f"Core gebaut: {TARGET_DIR} ({size / 1e6:.0f} MB)")
 
 
 if __name__ == "__main__":

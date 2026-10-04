@@ -12,7 +12,7 @@ app/dist/
 # Tauri
 app/src-tauri/target/
 app/src-tauri/gen/schemas/
-app/src-tauri/binaries/notizer-core*
+app/src-tauri/core-dist/
 
 # System
 .DS_Store

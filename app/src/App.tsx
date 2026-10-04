@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
-import { api } from './lib/api'
-import type { CoreInfo, Counts, Folder, Recording } from './lib/api'
+import { api, subscribeEvents } from './lib/api'
+import type { CoreEvent, CoreInfo, Counts, Folder, Job, Recording } from './lib/api'
 import { useTheme } from './lib/theme'
 import { Sidebar } from './components/Sidebar'
 import { RecordingList } from './components/RecordingList'
@@ -50,6 +50,8 @@ export default function App() {
   const [debounced, setDebounced] = useState('')
   const [dragging, setDragging] = useState(false)
   const [toasts, setToasts] = useState<Toast[]>([])
+  // letzter Auftrag je Aufnahme (auch fertige/fehlgeschlagene, für Meldungen)
+  const [jobs, setJobs] = useState<Record<string, Job>>({})
 
   const toast = useCallback((text: string, error = false) => {
     const id = Date.now() + Math.random()
@@ -97,6 +99,32 @@ export default function App() {
       alive = false
     }
   }, [refreshSidebar])
+
+  // Fortschritt der Transkription live vom Core
+  useEffect(() => {
+    if (coreState !== 'ok') return
+    return subscribeEvents((e: CoreEvent) => {
+      if (e.type === 'hello') {
+        setJobs((cur) => {
+          const next = { ...cur }
+          for (const j of e.jobs) next[j.recording_id] = j
+          return next
+        })
+      } else if (e.type === 'job') {
+        setJobs((cur) => ({ ...cur, [e.job.recording_id]: e.job }))
+        if (e.job.status === 'fertig') toast('Transkript fertig')
+        if (e.job.status === 'fehler') toast(e.job.error ?? 'Transkription fehlgeschlagen', true)
+      } else if (e.type === 'recording') {
+        setRecordings((rs) => rs.map((r) => (r.id === e.id ? { ...r, status: e.status } : r)))
+        if (e.status === 'transkribiert') {
+          void api.recordings().then((all) => {
+            const fresh = all.find((r) => r.id === e.id)
+            if (fresh) setRecordings((rs) => rs.map((r) => (r.id === e.id ? fresh : r)))
+          })
+        }
+      }
+    })
+  }, [coreState, toast])
 
   useEffect(() => {
     const t = setTimeout(() => setDebounced(query.trim()), 250)
@@ -222,6 +250,7 @@ export default function App() {
             query={query}
             onQuery={setQuery}
             onImport={(files) => void importFiles(files)}
+            jobs={jobs}
             trashDays={info?.trash_days ?? 30}
             onEmptyTrash={async () => {
               if (await confirmAction('Alle Aufnahmen im Papierkorb endgültig löschen?')) {
@@ -234,7 +263,11 @@ export default function App() {
               key={selected.id}
               recording={selected}
               folders={folders}
+              job={jobs[selected.id]}
+              transcriptVersion={jobs[selected.id]?.finished_at ?? ''}
               onError={(m) => toast(m, true)}
+              onToast={(m) => toast(m)}
+              onOpenSettings={() => navigate({ page: 'settings' })}
               onChange={(rec) => {
                 setRecordings((rs) => rs.map((r) => (r.id === rec.id ? rec : r)))
                 void refreshSidebar()
@@ -258,7 +291,9 @@ export default function App() {
       )}
       {view.page === 'templates' && <TemplatesPage />}
       {view.page === 'device' && <DevicePage />}
-      {view.page === 'settings' && <SettingsPage theme={theme.choice} onTheme={theme.setChoice} info={info} />}
+      {view.page === 'settings' && (
+        <SettingsPage theme={theme.choice} onTheme={theme.setChoice} info={info} onError={(m) => toast(m, true)} />
+      )}
 
       {dragging && (
         <div className="drop-overlay">

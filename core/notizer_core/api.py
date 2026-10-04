@@ -1,23 +1,62 @@
-"""REST-API des Cores (M0: Aufnahmen importieren, Ordner, Papierkorb)."""
+"""REST-API des Cores.
+
+M0: Aufnahmen importieren, Ordner, Papierkorb.
+M1: Transkription mit Sprechertrennung, Aufträge mit Fortschritt (WebSocket),
+Transkript bearbeiten, Export, Einstellungen.
+"""
 
 
+import asyncio
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
+from fastapi import (
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Request,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session, selectinload
 
 from . import __version__
 from .audio import probe_duration
 from .config import Settings
-from .db import AudioFile, Folder, Recording, make_session_factory, new_id, utcnow
+from .db import (
+    AudioFile,
+    Folder,
+    Job,
+    Recording,
+    RecordingSpeaker,
+    Segment,
+    Setting,
+    make_session_factory,
+    new_id,
+    utcnow,
+)
+from .engines import (
+    WHISPER_MODELS,
+    Diarizer,
+    FasterWhisperTranscriber,
+    SherpaDiarizer,
+    Transcriber,
+    diarization_downloaded,
+    whisper_downloaded,
+)
+from .exporting import to_srt, to_txt
+from .jobs import EventHub, JobManager, job_dict
 
 # Ursprünge, von denen die Oberfläche lädt: Tauri unter Windows bzw. Linux/macOS,
 # und der Vite-Entwicklungsserver.
@@ -57,6 +96,9 @@ class RecordingOut(BaseModel):
     status: str
     favorite: bool
     deleted_at: datetime | None
+    language: str | None = None
+    transcript_model: str | None = None
+    transcribed_at: datetime | None = None
     format: str | None = None
     original_name: str | None = None
     size_bytes: int | None = None
@@ -73,10 +115,76 @@ class ImportResult(BaseModel):
     skipped: list[dict]
 
 
+class TranscribeIn(BaseModel):
+    language: str | None = None  # "de", "en", … oder "auto"; None = Einstellung
+    diarize: bool | None = None
+    num_speakers: int | None = Field(default=None, ge=1, le=20)
+    model: str | None = None
+
+
+class SegmentOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: str
+    idx: int
+    start_ms: int
+    end_ms: int
+    text: str
+    speaker_label: str | None
+    edited: bool
+
+
+class SpeakerOut(BaseModel):
+    label: str
+    name: str | None
+    idx: int
+    talk_ms: int
+
+
+class TranscriptOut(BaseModel):
+    recording_id: str
+    language: str | None
+    model: str | None
+    transcribed_at: datetime | None
+    speakers: list[SpeakerOut]
+    segments: list[SegmentOut]
+
+
+class SegmentPatch(BaseModel):
+    text: str | None = None
+    speaker_label: str | None = None
+
+
+class SpeakerPatch(BaseModel):
+    name: str | None = None
+
+
+class SettingsModel(BaseModel):
+    whisper_model: str = "large-v3-turbo"
+    language: str = "de"  # "auto" = automatisch erkennen
+    diarize: bool = True
+    vocabulary: str = ""
+
+
+class SettingsPatch(BaseModel):
+    whisper_model: str | None = None
+    language: str | None = None
+    diarize: bool | None = None
+    vocabulary: str | None = Field(default=None, max_length=2000)
+
+
+class ExportIn(BaseModel):
+    format: str = "txt"  # txt | srt
+    path: str
+
+
 # ---------- App ----------
 
 
-def create_app(settings: Settings) -> FastAPI:
+def create_app(
+    settings: Settings,
+    transcriber: Transcriber | None = None,
+    diarizer: Diarizer | None = None,
+) -> FastAPI:
     settings.ensure_dirs()
     if not settings.token:
         settings.token = secrets.token_urlsafe(24)
@@ -148,6 +256,27 @@ def create_app(settings: Settings) -> FastAPI:
     with SessionLocal() as db:
         purge_trash(db)
 
+    # ----- Einstellungen (in der Datenbank) -----
+
+    def load_settings() -> dict:
+        with SessionLocal() as db:
+            stored = {row.key: row.value for row in db.scalars(select(Setting)).all()}
+        return SettingsModel(**{k: v for k, v in stored.items() if k in SettingsModel.model_fields}).model_dump()
+
+    hub = EventHub()
+    models_dir = settings.data_dir / "models"
+    jobs = JobManager(
+        SessionLocal,
+        settings.data_dir,
+        transcriber or FasterWhisperTranscriber(models_dir),
+        diarizer or SherpaDiarizer(models_dir),
+        load_settings,
+        hub,
+    )
+    jobs.recover()
+    app.state.jobs = jobs
+    app.state.hub = hub
+
     # ----- Status -----
 
     @app.get("/api/health")
@@ -182,7 +311,8 @@ def create_app(settings: Settings) -> FastAPI:
         if unfiled:
             stmt = stmt.where(Recording.folder_id.is_(None))
         if q:
-            stmt = stmt.where(Recording.title.icontains(q))
+            in_text = select(Segment.recording_id).where(Segment.text.icontains(q))
+            stmt = stmt.where(or_(Recording.title.icontains(q), Recording.id.in_(in_text)))
         order = Recording.deleted_at.desc() if trash else Recording.recorded_at.desc()
         return [to_out(r) for r in db.scalars(stmt.order_by(order)).all()]
 
@@ -369,5 +499,176 @@ def create_app(settings: Settings) -> FastAPI:
         db.delete(folder)
         db.commit()
 
-    return app
+    # ----- Transkription -----
 
+    def transcript_out(rec: Recording) -> TranscriptOut:
+        talk: dict[str, int] = {}
+        for seg in rec.segments:
+            if seg.speaker_label:
+                talk[seg.speaker_label] = talk.get(seg.speaker_label, 0) + (seg.end_ms - seg.start_ms)
+        return TranscriptOut(
+            recording_id=rec.id,
+            language=rec.language,
+            model=rec.transcript_model,
+            transcribed_at=rec.transcribed_at,
+            speakers=[
+                SpeakerOut(label=s.label, name=s.name, idx=s.idx, talk_ms=talk.get(s.label, 0))
+                for s in rec.speakers
+            ],
+            segments=[SegmentOut.model_validate(seg) for seg in rec.segments],
+        )
+
+    @app.post("/api/recordings/{rec_id}/transcribe")
+    def transcribe(rec_id: str, body: TranscribeIn, db: Db) -> dict:
+        rec = get_recording(db, rec_id)
+        if rec.deleted_at is not None:
+            raise HTTPException(409, "Aufnahme liegt im Papierkorb")
+        if body.model and body.model not in WHISPER_MODELS:
+            raise HTTPException(422, "Unbekanntes Modell")
+        options = body.model_dump(exclude_none=True)
+        return jobs.submit(rec.id, options)
+
+    @app.get("/api/jobs")
+    def list_jobs() -> list[dict]:
+        return jobs.active_jobs()
+
+    @app.get("/api/recordings/{rec_id}/job")
+    def last_job(rec_id: str, db: Db) -> dict | None:
+        """Letzter Auftrag einer Aufnahme, z. B. um eine Fehlermeldung anzuzeigen."""
+        job = db.scalars(select(Job).where(Job.recording_id == rec_id).order_by(Job.created_at.desc())).first()
+        return job_dict(job) if job else None
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    def cancel_job(job_id: str) -> dict:
+        result = jobs.cancel(job_id)
+        if result is None:
+            raise HTTPException(404, "Auftrag nicht gefunden")
+        return result
+
+    @app.get("/api/recordings/{rec_id}/transcript", response_model=TranscriptOut)
+    def read_transcript(rec_id: str, db: Db) -> TranscriptOut:
+        return transcript_out(get_recording(db, rec_id))
+
+    @app.patch("/api/segments/{seg_id}", response_model=SegmentOut)
+    def update_segment(seg_id: str, patch: SegmentPatch, db: Db) -> SegmentOut:
+        seg = db.get(Segment, seg_id)
+        if seg is None:
+            raise HTTPException(404, "Abschnitt nicht gefunden")
+        data = patch.model_dump(exclude_unset=True)
+        if "text" in data:
+            text = (data["text"] or "").strip()
+            if not text:
+                raise HTTPException(422, "Text darf nicht leer sein")
+            seg.text, seg.edited = text, True
+        if "speaker_label" in data:
+            label = data["speaker_label"]
+            if label:
+                known = db.scalars(
+                    select(RecordingSpeaker).where(
+                        RecordingSpeaker.recording_id == seg.recording_id, RecordingSpeaker.label == label
+                    )
+                ).first()
+                if known is None:
+                    raise HTTPException(422, "Unbekannter Sprecher")
+            seg.speaker_label = label
+        db.commit()
+        return SegmentOut.model_validate(seg)
+
+    @app.patch("/api/recordings/{rec_id}/speakers/{label}", response_model=SpeakerOut)
+    def rename_speaker(rec_id: str, label: str, patch: SpeakerPatch, db: Db) -> SpeakerOut:
+        spk = db.scalars(
+            select(RecordingSpeaker).where(RecordingSpeaker.recording_id == rec_id, RecordingSpeaker.label == label)
+        ).first()
+        if spk is None:
+            raise HTTPException(404, "Sprecher nicht gefunden")
+        spk.name = (patch.name or "").strip() or None
+        db.commit()
+        rec = get_recording(db, rec_id)
+        return next(s for s in transcript_out(rec).speakers if s.label == label)
+
+    def export_text(rec: Recording, fmt: str) -> str:
+        if not rec.segments:
+            raise HTTPException(409, "Noch kein Transkript vorhanden")
+        names = {s.label: (s.name or s.label) for s in rec.speakers}
+        if fmt == "srt":
+            return to_srt(rec, names)
+        if fmt == "txt":
+            return to_txt(rec, names)
+        raise HTTPException(422, "Format nicht unterstützt (txt oder srt)")
+
+    @app.get("/api/recordings/{rec_id}/export")
+    def export_download(rec_id: str, db: Db, format: str = "txt") -> PlainTextResponse:  # noqa: A002
+        rec = get_recording(db, rec_id)
+        text = export_text(rec, format)
+        safe = "".join(c for c in rec.title if c.isalnum() or c in " -_").strip() or "transkript"
+        return PlainTextResponse(
+            text,
+            headers={"Content-Disposition": f'attachment; filename="{safe}.{format}"'},
+        )
+
+    @app.post("/api/recordings/{rec_id}/export")
+    def export_to_file(rec_id: str, body: ExportIn, db: Db) -> dict:
+        # Den Pfad wählt der Nutzer im Speichern-Dialog der Desktop-App.
+        rec = get_recording(db, rec_id)
+        text = export_text(rec, body.format)
+        target = Path(body.path).expanduser()
+        if not target.is_absolute() or not target.parent.is_dir():
+            raise HTTPException(422, "Ungültiger Speicherort")
+        target.write_text(text, encoding="utf-8")
+        return {"path": str(target)}
+
+    # ----- Einstellungen & Modelle -----
+
+    @app.get("/api/settings", response_model=SettingsModel)
+    def read_settings() -> dict:
+        return load_settings()
+
+    @app.patch("/api/settings", response_model=SettingsModel)
+    def update_settings(patch: SettingsPatch, db: Db) -> dict:
+        data = patch.model_dump(exclude_none=True)
+        if "whisper_model" in data and data["whisper_model"] not in WHISPER_MODELS:
+            raise HTTPException(422, "Unbekanntes Modell")
+        for key, value in data.items():
+            row = db.get(Setting, key)
+            if row is None:
+                db.add(Setting(key=key, value=value))
+            else:
+                row.value = value
+        db.commit()
+        return load_settings()
+
+    @app.get("/api/models")
+    def list_models() -> dict:
+        return {
+            "whisper": [
+                {"name": name, **meta, "downloaded": whisper_downloaded(models_dir, name)}
+                for name, meta in WHISPER_MODELS.items()
+            ],
+            "diarization": {"downloaded": diarization_downloaded(models_dir), "size_mb": 33},
+            "models_dir": str(models_dir),
+        }
+
+    # ----- Ereignisse -----
+
+    @app.websocket("/ws")
+    async def events(ws: WebSocket) -> None:
+        token = ws.query_params.get("token", "")
+        if not secrets.compare_digest(token, settings.token):
+            await ws.close(code=4401)
+            return
+        await ws.accept()
+        q = hub.subscribe()
+        try:
+            await ws.send_json({"type": "hello", "jobs": jobs.active_jobs()})
+            while True:
+                try:
+                    event = await asyncio.wait_for(q.get(), timeout=20)
+                    await ws.send_json(event)
+                except asyncio.TimeoutError:
+                    await ws.send_json({"type": "ping"})
+        except (WebSocketDisconnect, RuntimeError):
+            pass
+        finally:
+            hub.unsubscribe(q)
+
+    return app

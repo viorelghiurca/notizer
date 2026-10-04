@@ -1,5 +1,5 @@
 import { useRef } from 'react'
-import type { Recording } from '../lib/api'
+import type { Job, Recording } from '../lib/api'
 import { STATUS_LABEL, dayGroup, formatDuration, listTime, shortDate } from '../lib/format'
 import { IconPlus, IconSearch, IconStar } from './Icons'
 
@@ -14,6 +14,7 @@ interface Props {
   onImport: (files: File[]) => void
   onEmptyTrash: () => void
   trashDays: number
+  jobs: Record<string, Job>
 }
 
 export const ACCEPT = '.mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/x-m4a,audio/wav,audio/x-wav'
@@ -21,7 +22,7 @@ export const ACCEPT = '.mp3,.m4a,.wav,audio/mpeg,audio/mp4,audio/x-m4a,audio/wav
 const GROUP_ORDER = ['Heute', 'Gestern', 'Diese Woche', 'Älter']
 
 export function RecordingList(props: Props) {
-  const { title, trash, recordings, selectedId, onSelect, query, onQuery, onImport, onEmptyTrash, trashDays } = props
+  const { title, trash, recordings, selectedId, onSelect, query, onQuery, onImport, onEmptyTrash, trashDays, jobs } = props
   const fileInput = useRef<HTMLInputElement>(null)
 
   const groups = trash
@@ -95,7 +96,13 @@ export function RecordingList(props: Props) {
                       <span>{r.format.toUpperCase()}</span>
                     </>
                   )}
-                  <span className={`chip ${r.status}`}>{STATUS_LABEL[r.status] ?? r.status}</span>
+                  <span className={`chip ${r.status}`}>
+                    {r.status === 'wird_transkribiert' && jobs[r.id]?.status === 'laeuft'
+                      ? `Läuft … ${Math.round(jobs[r.id].progress * 100)} %`
+                      : r.status === 'wird_transkribiert' && jobs[r.id]?.status === 'wartet'
+                        ? 'Wartet'
+                        : (STATUS_LABEL[r.status] ?? r.status)}
+                  </span>
                 </span>
               </button>
             ))}

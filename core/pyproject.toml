@@ -11,6 +11,10 @@ dependencies = [
     "pydantic-settings>=2.3",
     "platformdirs>=4.2",
     "mutagen>=1.47",
+    "websockets>=12",
+    "faster-whisper>=1.1",
+    "sherpa-onnx>=1.12",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]

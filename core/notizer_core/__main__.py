@@ -41,6 +41,23 @@ def _watch_parent() -> None:
         os._exit(0)
 
 
+def _selftest(audio: Path, data_dir: Path | None) -> None:
+    """Prüft, ob die eingebauten Audio- und KI-Bibliotheken laufen (Fehlersuche)."""
+    from faster_whisper.audio import decode_audio
+    from faster_whisper.vad import VadOptions, get_speech_timestamps
+
+    from .engines import SherpaDiarizer
+
+    samples = decode_audio(str(audio), sampling_rate=16000)
+    speech = get_speech_timestamps(samples, VadOptions())
+    print(json.dumps({"seconds": round(len(samples) / 16000, 2), "speech_chunks": len(speech)}), flush=True)
+    models = (data_dir or Settings().data_dir) / "models"
+    turns = SherpaDiarizer(models).diarize(
+        audio, num_speakers=None, on_progress=lambda *_: None, is_cancelled=lambda: False
+    )
+    print(json.dumps({"speakers": sorted({t.speaker for t in turns}), "turns": len(turns)}), flush=True)
+
+
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="notizer-core")
     parser.add_argument("--port", type=int, help="fester Port (Standard: frei wählen)")
@@ -51,7 +68,17 @@ def main(argv: list[str] | None = None) -> None:
         action="store_true",
         help="beenden, sobald die Standardeingabe schließt (die App ist beendet)",
     )
+    parser.add_argument(
+        "--selftest",
+        type=Path,
+        metavar="AUDIO",
+        help="Audio dekodieren, Sprachpausen und Sprecher erkennen, Ergebnis ausgeben, beenden",
+    )
     args = parser.parse_args(argv)
+
+    if args.selftest:
+        _selftest(args.selftest, args.data_dir)
+        return
 
     settings = Settings()
     if args.data_dir:

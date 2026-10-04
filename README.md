@@ -3,21 +3,39 @@
 Besprechungen aufnehmen, transkribieren und zusammenfassen – lokal auf deinem PC.
 Desktop-App für Windows und Linux, gebaut mit Tauri 2, React und einem Python-Core.
 
-**Stand: M0 (Grundgerüst).** Die App startet, bringt den Core mit und kann Audiodateien
-(MP3, M4A, WAV) importieren, abspielen, umbenennen, in Ordner sortieren und über den
-Papierkorb löschen. Transkription folgt in M1, die KI-Auswertung in M3.
+**Stand: M1 (Transkript).** Audiodateien (MP3, M4A, WAV) importieren, verwalten und
+lokal transkribieren – mit Sprechererkennung, Live-Fortschritt, Bearbeiten im Text,
+Sprecher umbenennen, Sprung zur Stelle im Player, Volltextsuche und Export als TXT/SRT.
+Die KI-Auswertung (Notizen, Mindmap, E-Mail, Termine) folgt in M3.
+
+## Transkription
+
+| Teil | Technik | Download beim ersten Gebrauch |
+| --- | --- | --- |
+| Spracherkennung | faster-whisper, Standard `large-v3-turbo` (wählbar: large-v3, medium, small) | 0,5–3 GB von Hugging Face |
+| Sprechertrennung | sherpa-onnx mit pyannote-Segmentierung 3.0 und WeSpeaker-Stimmmodell (ONNX, kein PyTorch) | ca. 33 MB von GitHub |
+
+Danach läuft alles ohne Internet. Modelle liegen im Datenordner unter `models/`.
+Läuft eine NVIDIA-Grafikkarte mit CUDA, nutzt faster-whisper sie automatisch, sonst die CPU.
+
+Ablauf eines Auftrags: Transkribieren (0–80 %) → Sprecher erkennen (80–98 %) → Zusammenführen.
+Ein Worker arbeitet die Aufträge nacheinander ab; Fortschritt kommt per WebSocket.
+Abbrechen ist jederzeit möglich; nach einem Neustart gelten laufende Aufträge als abgebrochen.
+
+Fehlersuche: `notizer-core --selftest datei.wav` prüft Audio-Dekodierung, Sprachpausen-
+Erkennung und Sprechertrennung und gibt das Ergebnis aus.
 
 ## Aufbau
 
 ```
 notizer/
 ├─ core/                 Notizer Core (Python, FastAPI, SQLite)
-│  ├─ notizer_core/      api.py, db.py, config.py, audio.py, __main__.py
-│  └─ tests/             pytest
+│  ├─ notizer_core/      api.py, db.py, engines.py, jobs.py, exporting.py, …
+│  └─ tests/             pytest; demo_server.py für Oberflächentests ohne Whisper-Modell
 ├─ app/                  Oberfläche (React + TypeScript, Vite)
 │  ├─ src/               App.tsx, components/, lib/
 │  └─ src-tauri/         Desktop-Hülle (Rust); startet den Core als Hintergrundprozess
-├─ scripts/build_core.py baut den Core als Einzeldatei für den Installer
+├─ scripts/build_core.py baut den Core als Ordner für den Installer
 └─ .github/workflows/    automatischer Build von .exe/.msi und .deb/.AppImage
 ```
 
@@ -67,6 +85,9 @@ npm run tauri dev
 Im Entwicklungsmodus startet die App den Core direkt aus `core/` mit der Python-venv;
 Änderungen an der Oberfläche erscheinen sofort.
 
+Oberfläche testen ohne Whisper-Modell (Sprechertrennung echt, Text vorgegeben):
+`cd core && python -m tests.demo_server --port 8765 --token dev --data-dir /tmp/notizer-demo`
+
 Nur im Browser, ohne Tauri:
 
 ```bash
@@ -92,14 +113,15 @@ npm run tauri build -- --config src-tauri/tauri.bundle.conf.json
 ```
 
 Ergebnis unter `app/src-tauri/target/release/bundle/`, z. B.
-`nsis/Notizer_0.1.0_x64-setup.exe`. Eine Windows-.exe lässt sich nur unter Windows bauen
+`nsis/Notizer_0.1.0_x64-setup.exe`. Der Core wird als Ordner `core/` mitgeliefert
+(rund 650 MB entpackt, im Installer etwa 220 MB), damit er ohne Entpacken sofort startet. Eine Windows-.exe lässt sich nur unter Windows bauen
 (lokal oder über GitHub Actions).
 
 Hinweis: Der Installer ist noch nicht signiert. Windows SmartScreen zeigt deshalb beim
 ersten Start „Unbekannter Herausgeber“ – über *Weitere Informationen → Trotzdem ausführen*
 geht es weiter.
 
-## API (M0)
+## API
 
 | Methode | Pfad | Zweck |
 | --- | --- | --- |
@@ -115,10 +137,20 @@ geht es weiter.
 | GET | `/api/recordings/{id}/audio?token=` | Audiodatei streamen |
 | GET/POST/PATCH/DELETE | `/api/folders[/{id}]` | Ordner verwalten |
 | GET | `/api/counts` | Zähler für die Seitenleiste |
+| POST | `/api/recordings/{id}/transcribe` | Auftrag starten (`language`, `diarize`, `num_speakers`, `model`) |
+| GET | `/api/jobs` · `/api/recordings/{id}/job` | laufende Aufträge · letzter Auftrag einer Aufnahme |
+| POST | `/api/jobs/{id}/cancel` | Auftrag abbrechen |
+| GET | `/api/recordings/{id}/transcript` | Abschnitte und Sprecher |
+| PATCH | `/api/segments/{id}` | Text oder Sprecher eines Abschnitts ändern |
+| PATCH | `/api/recordings/{id}/speakers/{label}` | Sprecher umbenennen |
+| GET/POST | `/api/recordings/{id}/export` | TXT/SRT herunterladen bzw. in Datei schreiben |
+| GET/PATCH | `/api/settings` | Modell, Standardsprache, Sprechertrennung, eigene Begriffe |
+| GET | `/api/models` | Modelle und ob sie schon geladen sind |
+| WS | `/ws?token=` | Ereignisse: Auftragsfortschritt, Statusänderungen |
 
 Aufnahmen im Papierkorb werden beim Start nach 30 Tagen endgültig gelöscht.
 
-## Nächster Meilenstein: M1 – Transkript
+## Nächste Meilensteine
 
-faster-whisper (Wort-Zeitstempel), Sprechertrennung mit pyannote, Transkript-Ansicht mit
-Sprechern und Sprung zur Stelle im Player, Job-Fortschritt per WebSocket.
+- **M2 – App-Grundlagen:** Export als PDF/Word, Transkript-Suche mit Treffern im Text, Sortierung
+- **M3 – KI-Ausgaben:** Vorlagen, Zusammenfassung, Mindmap, E-Mail, Termine, Frag Notizer, Stimmprofile
